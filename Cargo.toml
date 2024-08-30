@@ -2,7 +2,7 @@
 name = "jetproof"
 description = "A tool for creating huge jetton offchain merkle proofs."
 repository = "https://github.com/Rexagon/jetproof"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 

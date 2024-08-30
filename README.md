@@ -15,7 +15,7 @@ This tool is mostly IO-bound. It takes around **20s** to build a full dictionary
 ### Usage
 
 ```
-Usage: jetproof build <input> <output> [--start-from <start-from>] [--expire-at <expire-at>]
+Usage: jetproof build <input> [<output>] [--start-from <start-from>] [--expire-at <expire-at>] [-f] [-q]
 
 Build merkle proofs from a csv file.
 
@@ -26,6 +26,8 @@ Positional Arguments:
 Options:
   --start-from      a unix timestamp when the airdrop starts. (default: now)
   --expire-at       a unix timestamp when the airdrop ends. (default: never)
+  -f, --force       overwrite the output file if it exists.
+  -q, --quiet       hide the progress bar.
   --help            display usage information
 ```
 
@@ -43,6 +45,8 @@ Example output (`stdout`):
   "expire_at": 281474976710655
 }
 ```
+
+> Note: you can omit the output path for a dry run.
 
 ### Input CSV
 
