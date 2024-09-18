@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use crossbeam_channel as mpsc;
 use everscale_types::dict::DictKey;
 use everscale_types::error::Error;
@@ -16,12 +17,20 @@ use rand::Rng;
 use rayon::iter::ParallelIterator;
 use rayon::slice::{ParallelSlice, ParallelSliceMut};
 
+#[cfg(feature = "api")]
+mod api;
+
+#[cfg(feature = "api")]
+const CLAIM_FUNCTION_ID: u32 = 0x0df602d6;
+
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> Result<()> {
-    let App { cmd } = argh::from_env();
+    let App { cmd } = App::parse();
     match cmd {
+        #[cfg(feature = "api")]
+        Cmd::Api(cmd) => cmd.run(),
         Cmd::Build(cmd) => cmd.run(),
         Cmd::Verify(cmd) => cmd.run(),
         Cmd::Test(cmd) => cmd.run(),
@@ -30,16 +39,17 @@ fn main() -> Result<()> {
 }
 
 /// A tool for creating huge jetton offchain merkle proofs.
-#[derive(argh::FromArgs)]
+#[derive(Parser)]
+#[clap(subcommand_required = true)]
 struct App {
-    /// subcommand.
-    #[argh(subcommand)]
+    #[clap(subcommand)]
     cmd: Cmd,
 }
 
-#[derive(argh::FromArgs)]
-#[argh(subcommand)]
+#[derive(Subcommand)]
 enum Cmd {
+    #[cfg(feature = "api")]
+    Api(api::Cmd),
     Build(BuildProofs),
     Verify(VerifyProofs),
     Test(TestProof),
@@ -47,35 +57,38 @@ enum Cmd {
 }
 
 /// Build merkle proofs from a csv file.
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "build")]
+#[derive(Parser)]
 struct BuildProofs {
     /// path to the csv file (address, amount).
-    #[argh(positional)]
+    #[clap()]
     input: PathBuf,
 
     /// path to the output csv file (address, proof) or a RocksDB directory.
-    #[argh(positional)]
+    #[clap()]
     output: Option<PathBuf>,
 
-    /// output type (csv, rocksdb). (default: csv)
-    #[argh(option, short = 't', long = "type")]
-    ty: Option<DataType>,
+    /// output type (csv, api). (default: csv)
+    #[clap(short = 't', long = "type")]
+    ty: DataType,
+
+    /// build airdrop claim payload with this id instead of raw proofs.
+    #[clap(long)]
+    claim_function_id: Option<String>,
 
     /// a unix timestamp when the airdrop starts. (default: now)
-    #[argh(option)]
+    #[clap(long)]
     start_from: Option<u64>,
 
     /// a unix timestamp when the airdrop ends. (default: never)
-    #[argh(option)]
+    #[clap(long)]
     expire_at: Option<u64>,
 
     /// overwrite the output if it exists.
-    #[argh(switch, short = 'f')]
+    #[clap(short, long)]
     force: bool,
 
     /// hide the progress bar.
-    #[argh(switch, short = 'q')]
+    #[clap(short, long)]
     quiet: bool,
 }
 
@@ -87,6 +100,14 @@ impl BuildProofs {
 
         let start_from = self.start_from.unwrap_or_else(now_sec);
         let expire_at = self.expire_at.unwrap_or(EXPIRE_NEVER);
+
+        let claim_function_id = self
+            .claim_function_id
+            .map(|s| match s.strip_prefix("0x") {
+                Some(s) => u32::from_str_radix(s, 16),
+                None => s.parse(),
+            })
+            .transpose()?;
 
         let pg = ProgressBar::new_spinner();
         if self.quiet {
@@ -103,9 +124,19 @@ impl BuildProofs {
 
         if let Some(output) = &self.output {
             match self.ty {
-                None | Some(DataType::Csv) => build_proofs_csv(&pg, &entries, &dict_root, output)?,
-                #[cfg(feature = "rocksdb")]
-                Some(DataType::RocksDB) => build_proofs_rocksdb(&pg, &entries, &dict_root, output)?,
+                DataType::Csv => {
+                    build_proofs_csv(&pg, &entries, &dict_root, output, claim_function_id)?
+                }
+                #[cfg(feature = "api")]
+                DataType::Api => build_proofs_api(
+                    &pg,
+                    &entries,
+                    &dict_root,
+                    output,
+                    start_from,
+                    expire_at,
+                    claim_function_id.unwrap_or(CLAIM_FUNCTION_ID),
+                )?,
             }
         }
 
@@ -224,6 +255,7 @@ fn build_proofs_csv(
     entries: &[AirdropEntry],
     dict_root: &Cell,
     output: &Path,
+    claim_function_id: Option<u32>,
 ) -> Result<()> {
     use everscale_types::boc::ser::BocHeader;
 
@@ -281,6 +313,12 @@ fn build_proofs_csv(
                 .build()
                 .unwrap();
             let proof = CellBuilder::build_from(proof).unwrap();
+
+            let proof = match claim_function_id {
+                Some(function_id) => CellBuilder::build_from((function_id, proof)).unwrap(),
+                None => proof,
+            };
+
             BocHeader::<ahash::RandomState>::with_root(proof.as_ref())
                 .encode_rayon(&mut boc_buffer);
 
@@ -309,12 +347,15 @@ fn build_proofs_csv(
     Ok(())
 }
 
-#[cfg(feature = "rocksdb")]
-fn build_proofs_rocksdb(
+#[cfg(feature = "api")]
+fn build_proofs_api(
     pg: &ProgressBar,
     entries: &[AirdropEntry],
     dict_root: &Cell,
     output: &Path,
+    start_from: u64,
+    expire_at: u64,
+    claim_function_id: u32,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -326,7 +367,9 @@ fn build_proofs_rocksdb(
     pg.set_position(0);
     pg.set_length(entries.len() as _);
 
-    std::fs::remove_dir_all(output).context("failed to remove the output directory")?;
+    if output.exists() {
+        std::fs::remove_dir_all(output).context("failed to remove the output directory")?;
+    }
 
     let db = {
         let mut options = rocksdb::Options::default();
@@ -345,13 +388,24 @@ fn build_proofs_rocksdb(
         rocksdb::DB::open_cf(&options, output, &["default"]).context("failed to open RocksDB")?
     };
 
+    // Write general info
+    {
+        let mut info = Vec::new();
+        info.extend_from_slice(&0u32.to_le_bytes()); // 4 bytes for version
+        info.extend_from_slice(&start_from.to_le_bytes()); // 8 bytes for start_from
+        info.extend_from_slice(&expire_at.to_le_bytes()); // 8 bytes for expire_at
+        info.extend_from_slice(dict_root.repr_hash().as_array()); // 32 bytes for root_hash
+        db.put([0], info).context("failed to write info")?;
+    }
+
+    // Write chunks
     const CHUNK_SIZE: usize = 1 << 13;
     entries.par_chunks(CHUNK_SIZE).for_each(|chunk| {
         let mut boc_buffer = Vec::new();
-        let mut base64_boc_buffer = Vec::new();
+        let mut value_buffer = Vec::new();
 
         let mut key = [0u8; 33];
-        for (addr, _) in chunk {
+        for (addr, tokens) in chunk {
             key[0] = addr.workchain as u8;
             key[1..].copy_from_slice(addr.address.as_array());
 
@@ -368,15 +422,18 @@ fn build_proofs_rocksdb(
                 .build()
                 .unwrap();
             let proof = CellBuilder::build_from(proof).unwrap();
-            BocHeader::<ahash::RandomState>::with_root(proof.as_ref())
+            let payload = CellBuilder::build_from((claim_function_id, proof)).unwrap();
+
+            BocHeader::<ahash::RandomState>::with_root(payload.as_ref())
                 .encode_rayon(&mut boc_buffer);
 
-            base64_simd::STANDARD.encode_append(&boc_buffer, &mut base64_boc_buffer);
+            value_buffer.extend_from_slice(&tokens.into_inner().to_le_bytes());
+            base64_simd::STANDARD.encode_append(&boc_buffer, &mut value_buffer);
 
-            db.put(key, &base64_boc_buffer).unwrap();
+            db.put(key, &value_buffer).unwrap();
 
             boc_buffer.clear();
-            base64_boc_buffer.clear();
+            value_buffer.clear();
 
             pg.inc(1);
         }
@@ -400,8 +457,6 @@ fn build_proofs_rocksdb(
         let file_name = entry.file_name();
         let file_name_bytes = file_name.as_bytes();
 
-        println!("{file_name_bytes:?}");
-
         if file_name_bytes == b"LOG" || file_name_bytes.ends_with(b".log") {
             let path = entry.path();
 
@@ -420,23 +475,22 @@ fn build_proofs_rocksdb(
 }
 
 /// Verify merkle proofs from a csv file.
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "verify")]
+#[derive(Parser)]
 struct VerifyProofs {
     /// path to the csv file (address, amount) or a RocksDB directory.
-    #[argh(positional)]
+    #[clap()]
     input: PathBuf,
 
-    /// input type (csv, rocksdb). (default: csv)
-    #[argh(option, short = 't', long = "type")]
-    ty: Option<DataType>,
+    /// input type (csv, api).
+    #[clap(short = 't', long = "type")]
+    ty: DataType,
 
     /// root hash of the dictionary.
-    #[argh(option, short = 'r')]
+    #[clap(short = 'r')]
     root_hash: HashBytes,
 
     /// hide the progress bar.
-    #[argh(switch, short = 'q')]
+    #[clap(short, long)]
     quiet: bool,
 }
 
@@ -449,9 +503,9 @@ impl VerifyProofs {
         pg.enable_steady_tick(Duration::from_millis(100));
 
         match self.ty {
-            None | Some(DataType::Csv) => verify_proofs_csv(&pg, &self.input, &self.root_hash)?,
-            #[cfg(feature = "rocksdb")]
-            Some(DataType::RocksDB) => verify_proofs_rocksdb(&pg, &self.input, &self.root_hash)?,
+            DataType::Csv => verify_proofs_csv(&pg, &self.input, &self.root_hash)?,
+            #[cfg(feature = "api")]
+            DataType::Api => verify_proofs_api(&pg, &self.input, &self.root_hash)?,
         }
 
         pg.finish_and_clear();
@@ -499,8 +553,8 @@ fn verify_proofs_csv(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -> Re
     Ok(())
 }
 
-#[cfg(feature = "rocksdb")]
-fn verify_proofs_rocksdb(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -> Result<()> {
+#[cfg(feature = "api")]
+fn verify_proofs_api(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -> Result<()> {
     pg.println("Reading the RocksDB input...");
     pg.set_style(ProgressStyle::with_template("{spinner} Proofs checked: {human_len}").unwrap());
 
@@ -519,6 +573,26 @@ fn verify_proofs_rocksdb(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -
 
     let mut iterator = db.raw_iterator();
     iterator.seek_to_first();
+
+    {
+        let Some((key, value)) = iterator.item() else {
+            anyhow::bail!("General info not found");
+        };
+        anyhow::ensure!(key == &[0], "invalid key for general info");
+        anyhow::ensure!(value.len() == (4 + 8 + 8), "invalid value for general info");
+
+        let version = u32::from_le_bytes(value[..4].try_into().unwrap());
+        anyhow::ensure!(version == 0, "invalid version for general info");
+
+        let start_from = u64::from_le_bytes(value[4..12].try_into().unwrap());
+        let expire_at = u64::from_le_bytes(value[12..].try_into().unwrap());
+
+        pg.println(format!(
+            "version={version}, start_from={start_from}, expire_at={expire_at}"
+        ));
+
+        iterator.next();
+    }
 
     let mut proof_boc_buffer = Vec::new();
     loop {
@@ -552,19 +626,18 @@ fn verify_proofs_rocksdb(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -
 }
 
 /// Test a single proof.
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "test")]
+#[derive(Parser)]
 struct TestProof {
     /// account address.
-    #[argh(option, short = 'a')]
+    #[clap(short = 'a')]
     address: StdAddr,
 
     /// base64 encoded proof.
-    #[argh(option, short = 'p')]
+    #[clap(short = 'p')]
     proof: String,
 
     /// root hash of the dictionary.
-    #[argh(option, short = 'r')]
+    #[clap(short = 'r')]
     root_hash: HashBytes,
 }
 
@@ -601,23 +674,22 @@ impl TestProof {
 }
 
 /// Generate a csv file with random participants.
-#[derive(argh::FromArgs)]
-#[argh(subcommand, name = "generate")]
+#[derive(Parser)]
 struct GenerateParticipants {
     /// path to the output csv file.
-    #[argh(positional)]
+    #[clap()]
     output: PathBuf,
 
     /// number of participants.
-    #[argh(option, short = 'n')]
+    #[clap(short = 'n')]
     number: u64,
 
     /// overwrite the output file if it exists.
-    #[argh(switch, short = 'f')]
+    #[clap(short, long)]
     force: bool,
 
     /// hide the progress bar.
-    #[argh(switch, short = 'q')]
+    #[clap(short, long)]
     quiet: bool,
 }
 
@@ -674,10 +746,11 @@ fn pg_style() -> ProgressStyle {
     ProgressStyle::with_template("[ETA {eta_precise}] {bar:40} {pos:>7}/{len:7} {msg}").unwrap()
 }
 
+#[derive(Clone, Copy)]
 enum DataType {
     Csv,
-    #[cfg(feature = "rocksdb")]
-    RocksDB,
+    #[cfg(feature = "api")]
+    Api,
 }
 
 impl FromStr for DataType {
@@ -686,15 +759,15 @@ impl FromStr for DataType {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
             "csv" => Ok(Self::Csv),
-            "rocksdb" => {
-                #[cfg(not(feature = "rocksdb"))]
+            "api" => {
+                #[cfg(not(feature = "api"))]
                 {
-                    anyhow::bail!("compile with `rocksdb` feature");
+                    anyhow::bail!("compile with `api` feature");
                 }
 
-                #[cfg(feature = "rocksdb")]
+                #[cfg(feature = "api")]
                 {
-                    Ok(Self::RocksDB)
+                    Ok(Self::Api)
                 }
             }
             _ => anyhow::bail!("unknown output type: `{s}`"),
