@@ -25,3 +25,10 @@ tikv-jemallocator = { version = "0.6", features = [
     "unprefixed_malloc_on_supported_platforms",
     "background_threads",
 ] }
+
+rocksdb = { version = "0.22.0", features = [
+    "multi-threaded-cf",
+], default-features = false, optional = true }
+
+[features]
+rocksdb = ["dep:rocksdb"]

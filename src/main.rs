@@ -1,5 +1,6 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -53,9 +54,13 @@ struct BuildProofs {
     #[argh(positional)]
     input: PathBuf,
 
-    /// path to the output csv file (address, proof).
+    /// path to the output csv file (address, proof) or a RocksDB directory.
     #[argh(positional)]
     output: Option<PathBuf>,
+
+    /// output type (csv, rocksdb). (default: csv)
+    #[argh(option, short = 't', long = "type")]
+    ty: Option<DataType>,
 
     /// a unix timestamp when the airdrop starts. (default: now)
     #[argh(option)]
@@ -65,7 +70,7 @@ struct BuildProofs {
     #[argh(option)]
     expire_at: Option<u64>,
 
-    /// overwrite the output file if it exists.
+    /// overwrite the output if it exists.
     #[argh(switch, short = 'f')]
     force: bool,
 
@@ -77,7 +82,7 @@ struct BuildProofs {
 impl BuildProofs {
     fn run(self) -> Result<()> {
         if matches!(&self.output, Some(output) if output.exists() && !self.force) {
-            anyhow::bail!("Output file already exists. Use `--force` to overwrite it.");
+            anyhow::bail!("Output already exists. Use `--force` to overwrite it.");
         }
 
         let start_from = self.start_from.unwrap_or_else(now_sec);
@@ -97,7 +102,11 @@ impl BuildProofs {
         };
 
         if let Some(output) = &self.output {
-            build_proofs(&pg, &entries, &dict_root, output)?;
+            match self.ty {
+                None | Some(DataType::Csv) => build_proofs_csv(&pg, &entries, &dict_root, output)?,
+                #[cfg(feature = "rocksdb")]
+                Some(DataType::RocksDB) => build_proofs_rocksdb(&pg, &entries, &dict_root, output)?,
+            }
         }
 
         pg.finish_and_clear();
@@ -210,7 +219,7 @@ fn build_dict(
     Ok(root)
 }
 
-fn build_proofs(
+fn build_proofs_csv(
     pg: &ProgressBar,
     entries: &[AirdropEntry],
     dict_root: &Cell,
@@ -218,7 +227,7 @@ fn build_proofs(
 ) -> Result<()> {
     use everscale_types::boc::ser::BocHeader;
 
-    pg.println("Building proofs...");
+    pg.println("Building proofs (CSV)...");
     pg.reset();
     pg.set_style(pg_style());
     pg.set_position(0);
@@ -300,13 +309,127 @@ fn build_proofs(
     Ok(())
 }
 
+#[cfg(feature = "rocksdb")]
+fn build_proofs_rocksdb(
+    pg: &ProgressBar,
+    entries: &[AirdropEntry],
+    dict_root: &Cell,
+    output: &Path,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use everscale_types::boc::ser::BocHeader;
+
+    pg.println("Building proofs (RocksDB)...");
+    pg.reset();
+    pg.set_style(pg_style());
+    pg.set_position(0);
+    pg.set_length(entries.len() as _);
+
+    std::fs::remove_dir_all(output).context("failed to remove the output directory")?;
+
+    let db = {
+        let mut options = rocksdb::Options::default();
+
+        options.set_level_compaction_dynamic_level_bytes(true);
+
+        options.set_log_level(rocksdb::LogLevel::Error);
+        options.set_keep_log_file_num(2);
+        options.set_recycle_log_file_num(2);
+
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+
+        options.prepare_for_bulk_load();
+
+        rocksdb::DB::open_cf(&options, output, &["default"]).context("failed to open RocksDB")?
+    };
+
+    const CHUNK_SIZE: usize = 1 << 13;
+    entries.par_chunks(CHUNK_SIZE).for_each(|chunk| {
+        let mut boc_buffer = Vec::new();
+        let mut base64_boc_buffer = Vec::new();
+
+        let mut key = [0u8; 33];
+        for (addr, _) in chunk {
+            key[0] = addr.workchain as u8;
+            key[1..].copy_from_slice(addr.address.as_array());
+
+            let usage_tree = UsageTree::new(UsageTreeMode::OnDataAccess);
+
+            {
+                let dict_root = usage_tree.track(dict_root);
+                Dict::<StdAddr, ()>::from_raw(Some(dict_root))
+                    .get(addr)
+                    .ok();
+            }
+
+            let proof = MerkleProof::create(dict_root.as_ref(), usage_tree)
+                .build()
+                .unwrap();
+            let proof = CellBuilder::build_from(proof).unwrap();
+            BocHeader::<ahash::RandomState>::with_root(proof.as_ref())
+                .encode_rayon(&mut boc_buffer);
+
+            base64_simd::STANDARD.encode_append(&boc_buffer, &mut base64_boc_buffer);
+
+            db.put(key, &base64_boc_buffer).unwrap();
+
+            boc_buffer.clear();
+            base64_boc_buffer.clear();
+
+            pg.inc(1);
+        }
+    });
+
+    pg.println("Triggering compaction...");
+    db.compact_range(None::<[u8; 0]>, None::<[u8; 0]>);
+
+    pg.println("Flushing WAL...");
+    db.flush_wal(true)?;
+
+    pg.println("Cleanup empty LOG files...");
+
+    for entry in output.read_dir()? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let file_name_bytes = file_name.as_bytes();
+
+        println!("{file_name_bytes:?}");
+
+        if file_name_bytes == b"LOG" || file_name_bytes.ends_with(b".log") {
+            let path = entry.path();
+
+            anyhow::ensure!(
+                metadata.len() == 0,
+                "log file was not fully flushed: {}",
+                path.display()
+            );
+
+            std::fs::remove_file(entry.path())
+                .with_context(|| format!("failed to remove log file `{}`", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Verify merkle proofs from a csv file.
 #[derive(argh::FromArgs)]
 #[argh(subcommand, name = "verify")]
 struct VerifyProofs {
-    /// path to the csv file (address, amount).
+    /// path to the csv file (address, amount) or a RocksDB directory.
     #[argh(positional)]
     input: PathBuf,
+
+    /// input type (csv, rocksdb). (default: csv)
+    #[argh(option, short = 't', long = "type")]
+    ty: Option<DataType>,
 
     /// root hash of the dictionary.
     #[argh(option, short = 'r')]
@@ -323,52 +446,109 @@ impl VerifyProofs {
         if self.quiet {
             pg.set_draw_target(ProgressDrawTarget::hidden());
         }
-
-        pg.println("Reading the csv input...");
-        pg.set_style(
-            ProgressStyle::with_template("{spinner} Proofs checked: {human_len}").unwrap(),
-        );
         pg.enable_steady_tick(Duration::from_millis(100));
 
-        let file = std::fs::OpenOptions::new().read(true).open(self.input)?;
-        let reader = std::io::BufReader::new(file);
-
-        let mut proof_boc_buffer = Vec::new();
-        for (line, data) in reader.lines().enumerate() {
-            let line = line + 1;
-            let data = data?;
-
-            let Some((address, proof)) = data.split_once(',') else {
-                anyhow::bail!("invalid csv line: {line}");
-            };
-
-            let address = address
-                .trim()
-                .parse::<StdAddr>()
-                .with_context(|| format!("line {line}"))?;
-
-            base64_simd::STANDARD.decode_append(proof, &mut proof_boc_buffer)?;
-
-            let proof = Boc::decode(&proof_boc_buffer)?;
-            proof_boc_buffer.clear();
-
-            let proof = proof.parse::<MerkleProof>()?;
-            anyhow::ensure!(
-                proof.hash == self.root_hash,
-                "invalid root hash for {address}"
-            );
-
-            let entry = Dict::<StdAddr, ()>::from_raw(Some(proof.cell)).get(&address)?;
-            anyhow::ensure!(entry.is_some(), "{address} is not a participant");
-
-            pg.inc(1);
+        match self.ty {
+            None | Some(DataType::Csv) => verify_proofs_csv(&pg, &self.input, &self.root_hash)?,
+            #[cfg(feature = "rocksdb")]
+            Some(DataType::RocksDB) => verify_proofs_rocksdb(&pg, &self.input, &self.root_hash)?,
         }
 
         pg.finish_and_clear();
-
         pg.println("Done!");
+
         Ok(())
     }
+}
+
+fn verify_proofs_csv(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -> Result<()> {
+    pg.println("Reading the csv input...");
+    pg.set_style(ProgressStyle::with_template("{spinner} Proofs checked: {human_len}").unwrap());
+
+    let file = std::fs::OpenOptions::new().read(true).open(path)?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut proof_boc_buffer = Vec::new();
+    for (line, data) in reader.lines().enumerate() {
+        let line = line + 1;
+        let data = data?;
+
+        let Some((address, proof)) = data.split_once(',') else {
+            anyhow::bail!("invalid csv line: {line}");
+        };
+
+        let address = address
+            .trim()
+            .parse::<StdAddr>()
+            .with_context(|| format!("line {line}"))?;
+
+        base64_simd::STANDARD.decode_append(proof, &mut proof_boc_buffer)?;
+
+        let proof = Boc::decode(&proof_boc_buffer)?;
+        proof_boc_buffer.clear();
+
+        let proof = proof.parse::<MerkleProof>()?;
+        anyhow::ensure!(&proof.hash == root_hash, "invalid root hash for {address}");
+
+        let entry = Dict::<StdAddr, ()>::from_raw(Some(proof.cell)).get(&address)?;
+        anyhow::ensure!(entry.is_some(), "{address} is not a participant");
+
+        pg.inc(1);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "rocksdb")]
+fn verify_proofs_rocksdb(pg: &ProgressBar, path: &Path, root_hash: &HashBytes) -> Result<()> {
+    pg.println("Reading the RocksDB input...");
+    pg.set_style(ProgressStyle::with_template("{spinner} Proofs checked: {human_len}").unwrap());
+
+    let db = {
+        let mut options = rocksdb::Options::default();
+
+        options.set_level_compaction_dynamic_level_bytes(true);
+
+        options.set_log_level(rocksdb::LogLevel::Error);
+        options.set_keep_log_file_num(2);
+        options.set_recycle_log_file_num(2);
+
+        rocksdb::DB::open_cf_for_read_only(&options, path, &["default"], true)
+            .context("failed to open RocksDB")?
+    };
+
+    let mut iterator = db.raw_iterator();
+    iterator.seek_to_first();
+
+    let mut proof_boc_buffer = Vec::new();
+    loop {
+        let Some((key, value)) = iterator.item() else {
+            match iterator.status() {
+                Ok(()) => break,
+                Err(e) => anyhow::bail!("RocksDB iterator failed: {e}"),
+            }
+        };
+
+        assert_eq!(key.len(), 33);
+        let address = StdAddr::new(key[0] as i8, HashBytes::from_slice(&key[1..]));
+
+        base64_simd::STANDARD.decode_append(value, &mut proof_boc_buffer)?;
+
+        let proof = Boc::decode(&proof_boc_buffer)?;
+        proof_boc_buffer.clear();
+
+        let proof = proof.parse::<MerkleProof>()?;
+        anyhow::ensure!(&proof.hash == root_hash, "invalid root hash for {address}");
+
+        let entry = Dict::<StdAddr, ()>::from_raw(Some(proof.cell)).get(&address)?;
+        anyhow::ensure!(entry.is_some(), "{address} is not a participant");
+
+        pg.inc(1);
+
+        iterator.next();
+    }
+
+    Ok(())
 }
 
 /// Test a single proof.
@@ -492,6 +672,34 @@ fn now_sec() -> u64 {
 
 fn pg_style() -> ProgressStyle {
     ProgressStyle::with_template("[ETA {eta_precise}] {bar:40} {pos:>7}/{len:7} {msg}").unwrap()
+}
+
+enum DataType {
+    Csv,
+    #[cfg(feature = "rocksdb")]
+    RocksDB,
+}
+
+impl FromStr for DataType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "csv" => Ok(Self::Csv),
+            "rocksdb" => {
+                #[cfg(not(feature = "rocksdb"))]
+                {
+                    anyhow::bail!("compile with `rocksdb` feature");
+                }
+
+                #[cfg(feature = "rocksdb")]
+                {
+                    Ok(Self::RocksDB)
+                }
+            }
+            _ => anyhow::bail!("unknown output type: `{s}`"),
+        }
+    }
 }
 
 const EXPIRE_NEVER: u64 = (1 << 48) - 1;
